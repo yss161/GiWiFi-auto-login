@@ -3,7 +3,7 @@
 // @namespace    local.gi-wifi.auto-login
 // @version      1.0.0
 // @description  在 giWiFi/gportal 认证页面自动填写并提交校园网账号
-// @author       local
+// @author       https://github.com/yss161
 // @match        http://你的校园网认证ip/gportal/web/login*
 // @run-at       document-idle
 // @grant        GM_getValue

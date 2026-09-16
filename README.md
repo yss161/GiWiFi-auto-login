@@ -56,7 +56,7 @@
 脚本默认匹配以下地址：
 
 ```
-http://10.102.2.2/gportal/web/login*
+http://你的校园网ip/gportal/web/login*
 ```
 
 如果所在学校的认证地址不同，请修改脚本头部的 `@match` 规则，或自行添加对应的地址。

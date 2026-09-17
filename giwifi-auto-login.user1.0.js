@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         giWiFi 校园网自动认证
 // @namespace    local.gi-wifi.auto-login
-// @version      1.0.0
+// @version      1.1.0
 // @description  在 giWiFi/gportal 认证页面自动填写并提交校园网账号
 // @author       https://github.com/yss161
 // @match        http://你的校园网认证ip/gportal/web/login*
+// @match        http://你的校园网认证ip/*
+// @match        https://你的校园网认证ip/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -30,8 +32,14 @@
 
     // 是否打开页面后自动提交。验证码存在时会自动停止提交。
     autoSubmit: true,
-    submitDelayMs: 350
+    submitDelayMs: 350,
+
+    // 认证成功后关闭提示框，并尝试关闭当前浏览器窗口。
+    autoCloseAfterAuth: true,
+    closeDelayMs: 800,
+    authTimeoutMs: 30000
   };
+  const PENDING_AUTH_KEY = 'giwifiPendingAuth';
 
   const SELECTORS = {
     username: [
@@ -78,6 +86,12 @@
   let config = loadConfig();
   let attemptInProgress = false;
   let observer;
+  let authMonitorTimer;
+  let authTimeoutTimer;
+  let authStartedAt = 0;
+  let authStartUrl = '';
+  let closeScheduled = false;
+  let authDialogWasSeen = false;
 
   function loadConfig() {
     const stored = typeof GM_getValue === 'function'
@@ -112,6 +126,16 @@
       () => {
         saveConfig({ ...config, autoSubmit: !config.autoSubmit });
         window.alert(`自动提交已${config.autoSubmit ? '开启' : '关闭'}，刷新页面后生效。`);
+      }
+    );
+
+    GM_registerMenuCommand(
+      config.autoCloseAfterAuth ? '关闭认证后自动关窗' : '开启认证后自动关窗',
+      () => {
+        saveConfig({ ...config, autoCloseAfterAuth: !config.autoCloseAfterAuth });
+        window.alert(
+          `认证后自动关窗已${config.autoCloseAfterAuth ? '开启' : '关闭'}，刷新页面后生效。`
+        );
       }
     );
 
@@ -210,6 +234,205 @@
       && Boolean(document.querySelector('img[src*="captcha" i], img[src*="verify" i]'));
   }
 
+  function isLoginPath(url = window.location.href) {
+    try {
+      const parsed = new URL(url, window.location.href);
+      return /\/gportal\/web\/login(?:\/|$)/i.test(parsed.pathname);
+    } catch {
+      return /\/gportal\/web\/login(?:\/|$)/i.test(String(url));
+    }
+  }
+
+  function hasAuthFailureSignal(pageText) {
+    return /认证失败|登录失败|认证不成功|密码错误|账号或密码错误|authentication failed|login failed/i
+      .test(pageText);
+  }
+
+  function hasAuthSuccessSignal(pageText) {
+    return /认证成功|登录成功|认证通过|上网成功|联网成功|连接成功|已连接|authentication successful|login successful/i
+      .test(pageText);
+  }
+
+  function hasPendingAuthentication() {
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(PENDING_AUTH_KEY) || 'null');
+      if (!pending || !Number.isFinite(pending.startedAt)) return null;
+      if (Date.now() - pending.startedAt > Math.max(
+        5000,
+        Number(config.authTimeoutMs) || 30000
+      )) {
+        sessionStorage.removeItem(PENDING_AUTH_KEY);
+        return null;
+      }
+      return pending;
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberPendingAuthentication() {
+    try {
+      sessionStorage.setItem(PENDING_AUTH_KEY, JSON.stringify({
+        startedAt: authStartedAt,
+        startUrl: authStartUrl
+      }));
+    } catch {
+      // 某些隐私模式会禁用 sessionStorage，仍继续使用当前页面监控。
+    }
+  }
+
+  function forgetPendingAuthentication() {
+    try {
+      sessionStorage.removeItem(PENDING_AUTH_KEY);
+    } catch {
+      // 忽略不可用的 sessionStorage。
+    }
+  }
+
+  function authenticationSucceeded() {
+    if (!authStartedAt || Date.now() - authStartedAt < 1000) return false;
+
+    const pageText = document.body?.innerText || '';
+    if (hasAuthFailureSignal(pageText)) return false;
+    if (hasAuthSuccessSignal(pageText)) return true;
+
+    // 成功后通常会跳离 /gportal/web/login；这也覆盖认证后跳转到门户首页的版本。
+    return window.location.href !== authStartUrl && !isLoginPath(window.location.href);
+  }
+
+  function findAuthenticationDialog() {
+    const dialogSelectors = [
+      '[role="dialog"]',
+      '.aui_state',
+      '.aui_dialog',
+      '.artDialog',
+      '.art-dialog',
+      '.layui-layer'
+    ];
+    const dialogs = document.querySelectorAll(dialogSelectors.join(','));
+    for (const dialog of dialogs) {
+      const text = dialog.innerText || '';
+      if (isVisible(dialog) && /认证中|请勿关闭当前页面|秒后关闭/.test(text)) {
+        return dialog;
+      }
+    }
+    return null;
+  }
+
+  function closeAuthenticationDialog() {
+    const dialog = findAuthenticationDialog();
+    if (!dialog) return;
+
+    const closeButton = dialog.querySelector(
+      '[title*="关闭"], [aria-label*="关闭"], .aui_close, .artDialog_close, .layui-layer-close'
+    );
+    if (closeButton) {
+      closeButton.click();
+    } else {
+      dialog.remove();
+    }
+  }
+
+  function stopAuthenticationMonitor() {
+    window.clearInterval(authMonitorTimer);
+    window.clearTimeout(authTimeoutTimer);
+    authMonitorTimer = undefined;
+    authTimeoutTimer = undefined;
+  }
+
+  function tryCloseBrowser() {
+    try {
+      window.close();
+    } catch {
+      // 浏览器可能禁止关闭不是由脚本打开的标签页。
+    }
+
+    window.setTimeout(() => {
+      if (window.closed) return;
+
+      // 对部分浏览器中由脚本打开的窗口再尝试一次。
+      try {
+        const currentWindow = window.open('', '_self');
+        currentWindow?.close();
+      } catch {
+        // 忽略浏览器的关闭限制。
+      }
+
+      if (!window.closed) {
+        notify('认证成功，但浏览器阻止了自动关闭，请手动关闭当前标签页。', true);
+      }
+    }, 150);
+  }
+
+  function handleAuthenticationSuccess() {
+    if (closeScheduled) return;
+    closeScheduled = true;
+    stopAuthenticationMonitor();
+    forgetPendingAuthentication();
+    closeAuthenticationDialog();
+    notify('认证成功，正在关闭浏览器...');
+
+    window.setTimeout(tryCloseBrowser, Math.max(0, Number(config.closeDelayMs) || 0));
+  }
+
+  function checkAuthenticationCompletion() {
+    if (!config.autoCloseAfterAuth || closeScheduled) return;
+
+    const pageText = document.body?.innerText || '';
+    if (hasAuthFailureSignal(pageText)) {
+      stopAuthenticationMonitor();
+      forgetPendingAuthentication();
+      return;
+    }
+
+    if (findAuthenticationDialog()) {
+      authDialogWasSeen = true;
+    } else if (
+      authDialogWasSeen
+      && Date.now() - authStartedAt >= 2500
+    ) {
+      // 某些版本只有认证弹窗倒计时，没有成功文字或成功跳转。
+      handleAuthenticationSuccess();
+      return;
+    }
+
+    if (authenticationSucceeded()) {
+      handleAuthenticationSuccess();
+    }
+  }
+
+  function startAuthenticationMonitor() {
+    startAuthenticationMonitorFrom(Date.now(), window.location.href);
+  }
+
+  function startAuthenticationMonitorFrom(startedAt, startUrl) {
+    if (!config.autoCloseAfterAuth || authMonitorTimer) return;
+
+    authStartedAt = startedAt;
+    authStartUrl = startUrl;
+    closeScheduled = false;
+    authDialogWasSeen = false;
+    rememberPendingAuthentication();
+    authMonitorTimer = window.setInterval(checkAuthenticationCompletion, 250);
+    const timeoutMs = Math.max(
+      5000,
+      Number(config.authTimeoutMs) || 30000
+    );
+    const remainingMs = Math.max(1000, timeoutMs - (Date.now() - startedAt));
+    authTimeoutTimer = window.setTimeout(() => {
+      stopAuthenticationMonitor();
+      forgetPendingAuthentication();
+    }, remainingMs);
+  }
+
+  function isLoginButton(element) {
+    if (!element) return false;
+    const passwordInput = findPasswordInput();
+    const form = document.querySelector('#loginForm');
+    const submitButton = findSubmitButton(form, passwordInput);
+    return Boolean(submitButton && (element === submitButton || submitButton.contains(element)));
+  }
+
   function likelyLoginPage(passwordInput) {
     if (!passwordInput) return false;
     const url = `${location.pathname}${location.search}`.toLowerCase();
@@ -249,6 +472,7 @@
 
     window.setTimeout(() => {
       if (submitButton) {
+        startAuthenticationMonitor();
         submitButton.click();
       }
     }, Math.max(0, Number(config.submitDelayMs) || 0));
@@ -292,6 +516,16 @@
 
   function start() {
     registerMenu();
+    document.addEventListener('click', (event) => {
+      if (isLoginButton(event.target)) {
+        startAuthenticationMonitor();
+      }
+    }, true);
+    const pending = hasPendingAuthentication();
+    if (pending) {
+      startAuthenticationMonitorFrom(pending.startedAt, pending.startUrl || window.location.href);
+      checkAuthenticationCompletion();
+    }
     tryLogin();
 
     observer = new MutationObserver(() => {
